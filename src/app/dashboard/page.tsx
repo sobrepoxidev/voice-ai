@@ -15,6 +15,9 @@ export default function DashboardPage() {
   const [refreshContactos, setRefreshContactos] = useState(0);
   const [showConsola, setShowConsola] = useState(false);
 
+  // Lifted state for view type (raw=verificacion, active=llamadas, inactive=historial/bajas)
+  const [contactViewMode, setContactViewMode] = useState<'raw' | 'active' | 'inactive'>('raw');
+
   return (
     <div className="space-y-6">
       {/* Header con toggle de consola */}
@@ -54,6 +57,7 @@ export default function DashboardPage() {
           <ContactosWidget
             onCallStarted={() => setRefreshQueue((prev) => prev + 1)}
             refreshTrigger={refreshContactos}
+            onViewModeChange={setContactViewMode}
           />
         </div>
 
@@ -62,6 +66,7 @@ export default function DashboardPage() {
           <QueueWidget
             refreshTrigger={refreshQueue}
             onQueueEmpty={() => setRefreshHistory((prev) => prev + 1)}
+            viewMode={contactViewMode}
           />
         </div>
 

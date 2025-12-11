@@ -31,10 +31,12 @@ type RetellAgent = {
 
 export default function ContactosWidget({ 
   onCallStarted,
-  refreshTrigger = 0 
+  refreshTrigger = 0,
+  onViewModeChange
 }: { 
   onCallStarted?: () => void;
   refreshTrigger?: number;
+  onViewModeChange?: (mode: 'raw' | 'active' | 'inactive') => void;
 }) {
   const [contactos, setContactos] = useState<Contacto[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -43,6 +45,12 @@ export default function ContactosWidget({
   const [classifying, setClassifying] = useState(false);
   
   const [viewType, setViewType] = useState<ViewType>('raw');
+
+  // Sync view mode to parent
+  useEffect(() => {
+    onViewModeChange?.(viewType);
+  }, [viewType, onViewModeChange]);
+  
   const [selectedLine, setSelectedLine] = useState<TrunkLine>('didww');
   
   const [agents, setAgents] = useState<RetellAgent[]>([]);

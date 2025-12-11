@@ -680,6 +680,12 @@ async def process_classification_batch(phones: List[str]):
         if not p:
             continue
             
+        # Update Queue status to waiting/delay
+        supabase.table('classification_queue').insert({
+            'phone': p,
+            'status': 'waiting_entropy'
+        }).execute()
+
         # Entropy delay (Human-like behavior)
         if i > 0:
             # "Coffee Break" logic: every 5-8 calls, take a longer pause
@@ -693,12 +699,16 @@ async def process_classification_batch(phones: List[str]):
                 logger.info(f"⏳ Entropy: Waiting {delay:.2f}s before classifying {p}")
                 await asyncio.sleep(delay)
         
+        # Update Queue status to dialing
+        supabase.table('classification_queue').update({'status': 'dialing'}).eq('phone', p).eq('status', 'waiting_entropy').execute()
+
         # Originate call
         res = originate_classification_call(p)
         if res['success']:
             logger.info(f"🚀 Classification initiated for {p}")
         else:
             logger.error(f"❌ Failed to initiate classification for {p}: {res.get('reason')}")
+            supabase.table('classification_queue').update({'status': 'failed', 'cause': res.get('reason')}).eq('phone', p).eq('status', 'dialing').execute()
 
 @router.post("/batch-classify")
 async def batch_classify(req: ClassifyRequest, background_tasks: BackgroundTasks, token: str = Depends(verify_token)):
@@ -729,6 +739,17 @@ async def classifier_result(
     """
     logger.info(f"🕵️‍♂️ Classification Result: {phone} -> {status} ({cause})")
     
+    # Update classification_queue with final result for monitoring
+    try:
+        supabase.table('classification_queue').update({
+            'status': 'completed',
+            'result': status,
+            'cause': cause,
+            'updated_at': datetime.utcnow().isoformat()
+        }).eq('phone', phone).eq('status', 'dialing').execute()
+    except Exception as e:
+        logger.error(f"⚠️ Error updating classification_queue for {phone}: {e}")
+
     # 1. Buscar info del contacto original (para nombre/locale)
     try:
         # Intentamos obtener datos de outbound_call_contacts si existen

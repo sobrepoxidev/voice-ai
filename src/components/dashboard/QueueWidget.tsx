@@ -1,12 +1,15 @@
-// QueueWidget.tsx - ACTUALIZADO con todos los estados
+// QueueWidget.tsx - ACTUALIZADO con Monitor de Verificación y ActiveCallsMonitor
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
 import { 
   Phone, Clock, CheckCircle, XCircle, Loader2, 
   PhoneOff, PhoneMissed, Voicemail, AlertCircle, 
-  CalendarClock, Timer 
+  CalendarClock, Timer, Search, HelpCircle, Activity 
 } from 'lucide-react';
+import { createClient } from '@/lib/supabaseClient';
+
+// --- TIPOS ---
 
 type CallStatus = 
   | 'queued' 
@@ -36,6 +39,17 @@ type QueueStatus = {
   max_concurrent: number;
   calls: Call[];
 };
+
+type ClassificationItem = {
+  id: number;
+  phone: string;
+  status: 'pending' | 'waiting_entropy' | 'dialing' | 'completed' | 'failed';
+  result: string | null; // active, inactive, indeterminate
+  cause: string | null;
+  updated_at: string;
+};
+
+// --- CONFIG ---
 
 const STATUS_CONFIG: Record<CallStatus, {
   label: string;
@@ -105,7 +119,162 @@ const STATUS_CONFIG: Record<CallStatus, {
   },
 };
 
-export default function QueueWidget({ 
+// --- COMPONENTES ---
+
+function VerificationMonitor() {
+  const [items, setItems] = useState<ClassificationItem[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const supabase = createClient();
+
+    // Carga inicial
+    async function loadInitial() {
+      try {
+        const res = await fetch('/api/cola/classification-monitor');
+        const data = await res.json();
+        if (data.items) {
+          setItems(data.items);
+        }
+      } catch (error) {
+        console.error('Error loading classification monitor:', error);
+      } finally {
+        setLoading(false);
+      }
+    }
+    loadInitial();
+
+    // Suscripción Realtime
+    const channel = supabase
+      .channel('realtime_classification')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'classification_queue' }, () => {
+         loadInitial();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  if (loading && items.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="animate-spin text-gray-400" size={32} />
+      </div>
+    );
+  }
+
+  // Contadores
+  const activeCount = items.filter(i => ['waiting_entropy', 'dialing'].includes(i.status)).length;
+  const completedCount = items.filter(i => i.status === 'completed').length;
+  const failedCount = items.filter(i => i.status === 'failed').length;
+
+  return (
+    <div className="space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Search className="text-indigo-600" size={24} />
+          <h2 className="text-xl font-bold text-gray-900">Monitor de Verificación</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-500 uppercase font-bold tracking-wider">En vivo</span>
+          <div className="w-2 h-2 bg-indigo-500 rounded-full animate-pulse"></div>
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-indigo-50 p-3 rounded-lg border border-indigo-100">
+          <div className="text-2xl font-bold text-indigo-700">{activeCount}</div>
+          <div className="text-xs text-indigo-600 font-medium">Verificando</div>
+        </div>
+        <div className="bg-green-50 p-3 rounded-lg border border-green-100">
+          <div className="text-2xl font-bold text-green-700">{completedCount}</div>
+          <div className="text-xs text-green-600 font-medium">Completados</div>
+        </div>
+        <div className="bg-red-50 p-3 rounded-lg border border-red-100">
+          <div className="text-2xl font-bold text-red-700">{failedCount}</div>
+          <div className="text-xs text-red-600 font-medium">Fallidos</div>
+        </div>
+      </div>
+
+      {/* Lista */}
+      <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
+        {items.length === 0 ? (
+          <div className="text-center py-10 text-gray-400">
+            <Search size={32} className="mx-auto mb-2 opacity-20" />
+            <p>No hay actividad reciente</p>
+          </div>
+        ) : (
+          items.map((item) => {
+            let statusIcon = <Clock size={16} />;
+            let statusColor = "bg-gray-100 text-gray-600";
+            let statusText = "Pendiente";
+
+            if (item.status === 'waiting_entropy') {
+              statusIcon = <Clock size={16} className="animate-pulse" />;
+              statusColor = "bg-indigo-100 text-indigo-700";
+              statusText = "Esperando";
+            } else if (item.status === 'dialing') {
+              statusIcon = <Loader2 size={16} className="animate-spin" />;
+              statusColor = "bg-yellow-100 text-yellow-700";
+              statusText = "Marcando";
+            } else if (item.status === 'completed') {
+              if (item.result === 'active') {
+                statusIcon = <CheckCircle size={16} />;
+                statusColor = "bg-green-100 text-green-700";
+                statusText = "Activo";
+              } else if (item.result === 'inactive') {
+                statusIcon = <XCircle size={16} />;
+                statusColor = "bg-red-100 text-red-700";
+                statusText = "Inactivo";
+              } else {
+                statusIcon = <HelpCircle size={16} />;
+                statusColor = "bg-gray-100 text-gray-700";
+                statusText = "Indeterminado";
+              }
+            } else if (item.status === 'failed') {
+              statusIcon = <AlertCircle size={16} />;
+              statusColor = "bg-red-50 text-red-600";
+              statusText = "Falló";
+            }
+
+            return (
+              <div key={item.id} className="flex items-center justify-between p-3 bg-white border border-gray-100 rounded-lg shadow-sm hover:shadow-md transition-shadow">
+                <div className="flex items-center gap-3">
+                  <div className={`p-2 rounded-full ${statusColor}`}>
+                    {statusIcon}
+                  </div>
+                  <div>
+                    <p className="font-mono text-sm font-medium text-gray-900">{item.phone}</p>
+                    <p className="text-xs text-gray-500">
+                      {new Date(item.updated_at).toLocaleTimeString()}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="text-right">
+                  <span className={`text-xs px-2 py-1 rounded-full font-medium ${statusColor}`}>
+                    {statusText}
+                  </span>
+                  {item.cause && (
+                    <p className="text-[10px] text-gray-400 mt-1 max-w-[100px] truncate" title={item.cause}>
+                      {item.cause}
+                    </p>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ActiveCallsMonitor({ 
   onQueueEmpty, 
   refreshTrigger = 0 
 }: { 
@@ -176,9 +345,12 @@ export default function QueueWidget({
     <div className="space-y-4">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-bold text-gray-900">Monitor de Llamadas</h2>
         <div className="flex items-center gap-2">
-          <span className="text-sm text-gray-500">Auto-actualización</span>
+          <Activity className="text-green-600" size={24} />
+          <h2 className="text-xl font-bold text-gray-900">Monitor de Llamadas</h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-500 uppercase font-bold tracking-wider">En vivo</span>
           <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
         </div>
       </div>
@@ -272,5 +444,28 @@ export default function QueueWidget({
         )}
       </div>
     </div>
+  );
+}
+
+export default function QueueWidget({ 
+  onQueueEmpty, 
+  refreshTrigger = 0,
+  viewMode = 'active'
+}: { 
+  onQueueEmpty?: () => void;
+  refreshTrigger?: number;
+  viewMode?: 'raw' | 'active' | 'inactive';
+}) {
+  // --- MODO VERIFICACIÓN ---
+  if (viewMode === 'raw') {
+    return <VerificationMonitor />;
+  }
+
+  // --- MODO LLAMADAS ACTIVAS (Original) ---
+  return (
+    <ActiveCallsMonitor 
+      onQueueEmpty={onQueueEmpty} 
+      refreshTrigger={refreshTrigger} 
+    />
   );
 }
