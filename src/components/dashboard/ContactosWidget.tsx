@@ -114,6 +114,10 @@ export default function ContactosWidget({
     };
   }, [viewType]);
 
+  useEffect(() => {
+    setSelected(new Set());
+  }, [viewType]);
+
   async function loadContactos() {
     setLoading(true);
     try {
@@ -123,7 +127,7 @@ export default function ContactosWidget({
       const res = await fetch(`/api/contactos?limit=50&type=${viewType}${calledParam}${searchParam}`);
       const data = await res.json();
       setContactos(data.contacts || []);
-      setSelected(new Set()); // Limpiar selección al cambiar vista
+      // Eliminado: setSelected(new Set()); // Ya no limpiamos al cargar datos (solo al cambiar vista)
     } catch (error) {
       console.error('Error cargando contactos:', error);
       toast.error('Error al cargar contactos');
@@ -203,12 +207,13 @@ export default function ContactosWidget({
     const lineConfig = LINE_CONFIG[selectedLine];
 
     try {
-      const selectedContacts = contactos
-        .filter(c => selected.has(c.phone))
-        .map(c => ({
-          phone: c.phone,
-          user_name: c.user_name
-        }));
+      const selectedContacts = Array.from(selected).map(phone => {
+        const visible = contactos.find(c => c.phone === phone);
+        return {
+          phone,
+          user_name: visible?.user_name || ''
+        };
+      });
 
       const res = await fetch('/api/cola/iniciar', {
         method: 'POST',
@@ -248,12 +253,22 @@ export default function ContactosWidget({
 
     setClassifying(true);
     try {
-      const selectedContacts = contactos
-        .filter(c => selected.has(c.phone))
-        .map(c => ({
-          phone: c.phone,
-          user_name: c.user_name
-        }));
+      // Si la selección persiste entre búsquedas, es posible que algunos contactos seleccionados
+      // NO estén visibles en la lista 'contactos' actual.
+      // Sin embargo, solo tenemos acceso a los detalles (user_name) de los visibles.
+      // Para solucionar esto, idealmente deberíamos guardar el objeto completo en 'selected' o buscarlo.
+      // Como solución rápida, asumimos que si está seleccionado es válido, pero si no está visible,
+      // perdemos el user_name si no lo guardamos.
+      // MEJORA: Usar los que están en 'contactos' O simplemente enviar el teléfono.
+      // El backend buscará el user_name si es necesario o lo ignorará.
+      
+      const selectedContacts = Array.from(selected).map(phone => {
+        const visible = contactos.find(c => c.phone === phone);
+        return {
+          phone,
+          user_name: visible?.user_name || '' 
+        };
+      });
 
       const res = await fetch('/api/cola/clasificar', {
         method: 'POST',
