@@ -828,6 +828,9 @@ def originate_classification_call(to_number: str):
         response = manager.send_action({
             'Action': 'Originate',
             'Channel': f'Local/{clean_num}@classifier-originate',
+            'Context': 'classifier-done',
+            'Exten': 's',
+            'Priority': '1',
             'Timeout': '30000',
             'Async': 'true'
         })
