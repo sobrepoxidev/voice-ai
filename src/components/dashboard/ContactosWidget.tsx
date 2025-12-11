@@ -32,11 +32,13 @@ type RetellAgent = {
 export default function ContactosWidget({ 
   onCallStarted,
   refreshTrigger = 0,
-  onViewModeChange
+  onViewModeChange,
+  onClassifyStarted
 }: { 
   onCallStarted?: () => void;
   refreshTrigger?: number;
   onViewModeChange?: (mode: 'raw' | 'active' | 'inactive') => void;
+  onClassifyStarted?: () => void;
 }) {
   const [contactos, setContactos] = useState<Contacto[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -281,8 +283,8 @@ export default function ContactosWidget({
       if (res.ok) {
         toast.success('Clasificación iniciada en background (Intervalos aleatorios)');
         setSelected(new Set());
-        // No recargamos inmediatamente porque tarda unos segundos, pero limpiamos selección
-        setTimeout(loadContactos, 2000); 
+        setTimeout(loadContactos, 2000);
+        onClassifyStarted?.();
       } else {
         toast.error('Error al iniciar clasificación');
       }

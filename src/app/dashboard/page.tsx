@@ -58,6 +58,7 @@ export default function DashboardPage() {
             onCallStarted={() => setRefreshQueue((prev) => prev + 1)}
             refreshTrigger={refreshContactos}
             onViewModeChange={setContactViewMode}
+            onClassifyStarted={() => setRefreshQueue((prev) => prev + 1)}
           />
         </div>
 

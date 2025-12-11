@@ -121,41 +121,88 @@ const STATUS_CONFIG: Record<CallStatus, {
 
 // --- COMPONENTES ---
 
-function VerificationMonitor() {
+function VerificationMonitor({ 
+  refreshTrigger = 0,
+  onQueueEmpty 
+}: { 
+  refreshTrigger?: number;
+  onQueueEmpty?: () => void;
+}) {
   const [items, setItems] = useState<ClassificationItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const wasActiveRef = useRef(false);
+  const onQueueEmptyRef = useRef(onQueueEmpty);
+
+  // Mantener el ref actualizado
+  useEffect(() => {
+    onQueueEmptyRef.current = onQueueEmpty;
+  }, [onQueueEmpty]);
+
+  const handleDataUpdate = (newItems: ClassificationItem[]) => {
+    setItems(newItems);
+    const activeCount = newItems.filter(i => ['waiting_entropy', 'dialing'].includes(i.status)).length;
+    const hasActive = activeCount > 0;
+    
+    if (wasActiveRef.current && !hasActive) {
+      onQueueEmptyRef.current?.();
+    }
+    wasActiveRef.current = hasActive;
+  };
 
   useEffect(() => {
     const supabase = createClient();
 
-    // Carga inicial
-    async function loadInitial() {
+    const loadInitial = async () => {
       try {
         const res = await fetch('/api/cola/classification-monitor');
         const data = await res.json();
         if (data.items) {
-          setItems(data.items);
+          handleDataUpdate(data.items);
         }
       } catch (error) {
         console.error('Error loading classification monitor:', error);
       } finally {
         setLoading(false);
       }
-    }
+    };
     loadInitial();
 
-    // Suscripción Realtime
     const channel = supabase
       .channel('realtime_classification')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'classification_queue' }, () => {
-         loadInitial();
+        loadInitial();
       })
       .subscribe();
 
+    const handler = () => {
+      if (document.visibilityState === 'visible') {
+        loadInitial();
+      }
+    };
+    const interval = window.setInterval(handler, 4000);
+    document.addEventListener('visibilitychange', handler);
+
     return () => {
       supabase.removeChannel(channel);
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handler);
     };
   }, []);
+
+  useEffect(() => {
+    const fetchNow = async () => {
+      try {
+        const res = await fetch('/api/cola/classification-monitor');
+        const data = await res.json();
+        if (data.items) {
+          handleDataUpdate(data.items);
+        }
+      } catch (error) {
+        console.error('Error loading classification monitor:', error);
+      }
+    };
+    fetchNow();
+  }, [refreshTrigger]);
 
   if (loading && items.length === 0) {
     return (
@@ -291,30 +338,36 @@ function ActiveCallsMonitor({
   const wasActiveRef = useRef(false);
 
   useEffect(() => {
-    loadQueueStatus();
-    const interval = setInterval(loadQueueStatus, 3000);
-    return () => clearInterval(interval);
-  }, [refreshTrigger]);
+    const fn = async () => {
+      try {
+        const res = await fetch('/api/cola/monitor');
+        const data = await res.json();
+        setStatus(data);
 
-  async function loadQueueStatus() {
-    try {
-      const res = await fetch('/api/cola/monitor');
-      const data = await res.json();
-      setStatus(data);
-
-      const hasActiveCalls = data.calls && data.calls.length > 0;
-
-      if (wasActiveRef.current && !hasActiveCalls) {
-        onQueueEmpty?.();
+        const hasActiveCalls = data.calls && data.calls.length > 0;
+        if (wasActiveRef.current && !hasActiveCalls) {
+          onQueueEmpty?.();
+        }
+        wasActiveRef.current = hasActiveCalls;
+      } catch (error) {
+        console.error('Error cargando cola:', error);
+      } finally {
+        setLoading(false);
       }
-
-      wasActiveRef.current = hasActiveCalls;
-    } catch (error) {
-      console.error('Error cargando cola:', error);
-    } finally {
-      setLoading(false);
-    }
-  }
+    };
+    fn();
+    const handler = () => {
+      if (document.visibilityState === 'visible') {
+        fn();
+      }
+    };
+    const interval = window.setInterval(handler, 3000);
+    document.addEventListener('visibilitychange', handler);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handler);
+    };
+  }, [refreshTrigger]);
 
   function formatDuration(seconds?: number) {
     if (!seconds) return '0:00';
@@ -458,7 +511,12 @@ export default function QueueWidget({
 }) {
   // --- MODO VERIFICACIÓN ---
   if (viewMode === 'raw') {
-    return <VerificationMonitor />;
+    return (
+      <VerificationMonitor 
+        refreshTrigger={refreshTrigger} 
+        onQueueEmpty={onQueueEmpty}
+      />
+    );
   }
 
   // --- MODO LLAMADAS ACTIVAS (Original) ---

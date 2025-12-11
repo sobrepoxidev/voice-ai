@@ -706,6 +706,16 @@ async def process_classification_batch(phones: List[str]):
         res = originate_classification_call(p)
         if res['success']:
             logger.info(f"🚀 Classification initiated for {p}")
+            async def _fallback():
+                await asyncio.sleep(45)
+                try:
+                    supabase.table('classification_queue').update({
+                        'status': 'failed',
+                        'cause': 'timeout'
+                    }).eq('phone', p).eq('status', 'dialing').execute()
+                except Exception:
+                    pass
+            asyncio.create_task(_fallback())
         else:
             logger.error(f"❌ Failed to initiate classification for {p}: {res.get('reason')}")
             supabase.table('classification_queue').update({'status': 'failed', 'cause': res.get('reason')}).eq('phone', p).eq('status', 'dialing').execute()
@@ -818,9 +828,6 @@ def originate_classification_call(to_number: str):
         response = manager.send_action({
             'Action': 'Originate',
             'Channel': f'Local/{clean_num}@classifier-originate',
-            'Context': 'classifier-out',  # CORRECCION: Debe coincidir o ser válido
-            'Exten': clean_num,          # CORRECCION: Pasar el numero como extensión
-            'Priority': '1',
             'Timeout': '30000',
             'Async': 'true'
         })
