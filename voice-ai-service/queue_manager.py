@@ -1,4 +1,5 @@
-# /opt/voice-ai-service/queue_manager.py - VERSIÓN CORREGIDA
+# El dialplan notifica AMD via HTTP, no esperamos eventos AMI
+
 import redis
 import json
 import uuid
@@ -40,12 +41,8 @@ class CallState(str, Enum):
 
 # ========== FUNCIÓN STANDALONE PARA ACTUALIZAR SUPABASE ==========
 def update_supabase_status(job_id: str, phone: str, status: str, retell_call_id: str = None):
-    """
-    Actualiza estado en Supabase outbound_call_queue
-    Esta función es STANDALONE (fuera de la clase)
-    """
+    """Actualiza estado en Supabase outbound_call_queue"""
     try:
-        # Mapeo de estados queue_manager → Supabase
         status_map = {
             'queued': 'queued',
             'calling': 'calling',
@@ -65,16 +62,19 @@ def update_supabase_status(job_id: str, phone: str, status: str, retell_call_id:
         if retell_call_id:
             update_data['retell_call_id'] = retell_call_id
 
-        # Buscar por phone y job_id (más seguro)
+        # Si es finished o canceled, marcar como inactive
+        if supabase_status in ['finished', 'canceled']:
+            update_data['active'] = False
+
         result = supabase.table('outbound_call_queue') \
             .update(update_data) \
             .eq('phone', phone) \
             .eq('job_id', job_id) \
             .execute()
 
-        logger.info(f"✅ Supabase updated: {phone} → {supabase_status}")
+        logger.info(f"✅ Supabase: {phone} → {supabase_status}")
     except Exception as e:
-        logger.error(f"❌ Supabase update failed: {e}")
+        logger.error(f"❌ Supabase error: {e}")
 
 
 # ========== CLASES ==========
@@ -106,7 +106,6 @@ class CallJob:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
         }
-        # Quitar los None para que Redis no se queje
         return {k: v for k, v in raw.items() if v is not None}
 
 
@@ -117,17 +116,14 @@ class CallQueueManager:
         self.active_count = 0
         self.lock = threading.Lock()
 
-        # Iniciar workers (20 threads)
-        logger.info(f"Starting {max_concurrent} worker threads...")
+        logger.info(f"Starting {max_concurrent} workers...")
         for i in range(max_concurrent):
             t = threading.Thread(target=self._worker, daemon=True, name=f"Worker-{i}")
             t.start()
         logger.info(f"✅ {max_concurrent} workers started")
 
     def submit_call(self, to_number: str, from_number: str, agent_id: str, variables: dict = None) -> str:
-        """Agrega llamada a la cola"""
         job_id = str(uuid.uuid4())
-
         job = CallJob(
             job_id=job_id,
             to_number=to_number,
@@ -135,33 +131,28 @@ class CallQueueManager:
             agent_id=agent_id
         )
 
-        # Guardar en Redis
         try:
             redis_client.hset(f"call:{job_id}", mapping=job.to_dict())
-            redis_client.expire(f"call:{job_id}", 7200)  # 2 horas TTL
+            redis_client.expire(f"call:{job_id}", 7200)
         except Exception as e:
             logger.error(f"Redis error: {e}")
             raise
 
-        # Agregar a cola con variables
         self.call_queue.put((job_id, variables or {}))
-        logger.info(f"📞 Job {job_id} queued for {to_number}")
-
+        logger.info(f"📞 Job {job_id[:8]}... queued for {to_number}")
         return job_id
 
     def _worker(self):
-        """Worker thread que procesa llamadas"""
         thread_name = threading.current_thread().name
         logger.info(f"🔧 {thread_name} ready")
 
         while True:
-            # Bloquea hasta que haya trabajo
             job_id, variables = self.call_queue.get()
 
             with self.lock:
                 self.active_count += 1
 
-            logger.info(f"🚀 {thread_name} processing {job_id}")
+            logger.info(f"🚀 {thread_name} processing {job_id[:8]}...")
 
             try:
                 self._process_call(job_id, variables)
@@ -174,7 +165,6 @@ class CallQueueManager:
                 self.call_queue.task_done()
 
     def _process_call(self, job_id: str, variables: dict):
-        """Procesa una llamada individual"""
         job_data = redis_client.hgetall(f"call:{job_id}")
         if not job_data:
             raise ValueError(f"Job {job_id} not found")
@@ -183,11 +173,10 @@ class CallQueueManager:
         from_number = job_data['from_number']
         agent_id = job_data['agent_id']
 
-        # Actualizar a CALLING
+        # CALLING
         self._update_state(job_id, CallState.CALLING)
         redis_client.hset(f"call:{job_id}", "started_at", datetime.utcnow().isoformat())
 
-        # Importar funciones de retell.py
         from retell import register_call_with_retell_sync, originate_in_asterisk
 
         # Registrar en Retell
@@ -197,37 +186,26 @@ class CallQueueManager:
 
         redis_client.hset(f"call:{job_id}", "retell_call_id", retell_call_id)
         update_supabase_status(job_id, to_number, 'calling', retell_call_id)
-        logger.info(f"📋 Job {job_id} → Retell {retell_call_id}")
+        logger.info(f"📋 Job {job_id[:8]}... → Retell {retell_call_id}")
 
-        # ========== ORIGINAR EN ASTERISK (BLOQUEANTE HASTA QUE TERMINE) ==========
+        # ORIGINAR - Retorna inmediatamente
+        # El dialplan notificará el resultado via HTTP al endpoint /api/retell/amd-result
         result = originate_in_asterisk(to_number, from_number, retell_call_id)
+        logger.info(f"📊 Originate result for job {job_id[:8]}: {result}")
 
-        # ========== PROCESAR RESULTADO FINAL ==========
-        if result.get('detected') and result['reason'] == 'VOICEMAIL':
-            # AMD detectó voicemail
-            self._update_state(job_id, CallState.VOICEMAIL,
-                             amd_result='MACHINE',
-                             error=f"Voicemail: {result.get('cause')}")
-            logger.info(f"📞 Job {job_id} → VOICEMAIL")
-
-        elif result.get('reason') == 'COMPLETED':
-            # ✅ NUEVO: Llamada completada normalmente
-            self._update_state(job_id, CallState.COMPLETED)
-            logger.info(f"✅ Job {job_id} → COMPLETED (duration: {result.get('hangup_cause')})")
-
-        elif result['success']:
-            # Llamada conectó pero todavía activa (timeout de 10min)
-            self._update_state(job_id, CallState.ACTIVE)
-            logger.info(f"✅ Job {job_id} → STILL ACTIVE after timeout")
-
+        if result.get('success'):
+            # Llamada originada exitosamente
+            # El estado final será actualizado por:
+            # 1. El dialplan via /api/retell/amd-result (VOICEMAIL/HUMAN)
+            # 2. El webhook de Retell (call_ended/call_analyzed)
+            logger.info(f"✅ Job {job_id[:8]}... → ORIGINATED (waiting for AMD/webhook)")
         else:
-            # Error general
+            # Error al originar
             self._update_state(job_id, CallState.FAILED,
-                             error=result.get('error', 'Unknown error'))
-            logger.info(f"❌ Job {job_id} → FAILED: {result.get('error')}")
+                             error=result.get('hangup_cause', 'Originate failed'))
+            logger.info(f"❌ Job {job_id[:8]}... → FAILED")
 
     def _update_state(self, job_id: str, state: CallState, **kwargs):
-        """Actualiza estado en Redis Y Supabase"""
         updates = {"state": state.value}
 
         if 'error' in kwargs:
@@ -237,10 +215,8 @@ class CallQueueManager:
         if state == CallState.COMPLETED:
             updates['completed_at'] = datetime.utcnow().isoformat()
 
-        # Actualizar Redis
         redis_client.hset(f"call:{job_id}", mapping=updates)
 
-        # 🔥 Actualizar Supabase usando función standalone
         job_data = redis_client.hgetall(f"call:{job_id}")
         if job_data:
             update_supabase_status(
@@ -251,19 +227,14 @@ class CallQueueManager:
             )
 
     def get_job(self, job_id: str) -> dict:
-        """Obtiene job desde Redis"""
         data = redis_client.hgetall(f"call:{job_id}")
-        if not data:
-            return None
-        return data
+        return data if data else None
 
     def get_active_count(self) -> int:
-        """Cuenta llamadas activas"""
         with self.lock:
             return self.active_count
 
     def get_queue_size(self) -> int:
-        """Tamaño de la cola"""
         return self.call_queue.qsize()
 
 

@@ -1,15 +1,18 @@
-# /opt/voice-ai-service/retell.py - VERSIÓN LIMPIA
-
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import httpx
 import os
-import asterisk.manager
+import random
+import asyncio
 from typing import Optional, Dict, List
 from queue_manager import queue_manager, CallState
+from datetime import datetime
+import logging
+from supabase import create_client, Client
 
 router = APIRouter(prefix="/api/retell", tags=["Retell AI"])
+logger = logging.getLogger(__name__)
 
 RETELL_API_KEY = os.getenv("RETELL_API_KEY")
 RETELL_AGENT_ID_DEFAULT = os.getenv("RETELL_AGENT_ID_DEFAULT")
@@ -22,8 +25,16 @@ AMI_PASS = os.getenv("AMI_PASS")
 
 DEFAULT_FROM_NUMBER = "+18887719555"
 
+# Supabase Client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
 # Diccionario en memoria para transferencias
 pending_transfers = {}
+# Variable global para tracking de transferencias
+transfer_channels = {}  # {transfer_id: {'retell_channel': ..., 'phone': ...}}
+
 
 # ==========================================================
 #                    MODELOS
@@ -56,15 +67,83 @@ def normalize_vars(d: Optional[dict]) -> dict:
         out[k] = str(v)
     return out
 
+
+# ==========================================================
+#     🔥 NUEVO: ENDPOINT PARA AMD DESDE DIALPLAN
+# ==========================================================
+# ==========================================================
+#     🔥 ENDPOINT AMD ACTUALIZADO - Todos los estados
+# ==========================================================
+# Reemplaza las funciones amd_result en retell.py
+
+@router.post("/amd-result")
+async def amd_result_post(
+    call_id: str,
+    result: str,
+    cause: str = ""
+):
+    """Endpoint llamado desde Asterisk dialplan"""
+    return await _handle_amd_result(call_id, result, cause)
+
+
+@router.get("/amd-result")
+async def amd_result_get(
+    call_id: str,
+    result: str,
+    cause: str = ""
+):
+    """Versión GET para CURL desde dialplan"""
+    return await _handle_amd_result(call_id, result, cause)
+
+
+async def _handle_amd_result(call_id: str, result: str, cause: str):
+    """Lógica común para manejar resultado de llamada desde dialplan"""
+    logger.info(f"📞 AMD Result: call_id={call_id}, result={result}, cause={cause}")
+
+    # Mapeo de resultados a estados de DB
+    status_map = {
+        'VOICEMAIL': 'voicemail',
+        'NO_ANSWER': 'no_answer',
+        'BUSY': 'busy',
+        'FAILED': 'failed',
+        'HUMAN': 'active',  # Humano detectado → activo, Retell manejará el resto
+    }
+
+    db_status = status_map.get(result.upper(), 'failed')
+
+    # Estados que marcan la llamada como inactiva
+    inactive_statuses = ['voicemail', 'no_answer', 'busy', 'failed']
+    is_inactive = db_status in inactive_statuses
+
+    try:
+        update_data = {
+            'status': db_status,
+            'updated_at': datetime.utcnow().isoformat(),
+            'end_reason': f"{result}:{cause}" if cause else result
+        }
+
+        if is_inactive:
+            update_data['active'] = False
+
+        supabase.table('outbound_call_queue') \
+            .update(update_data) \
+            .eq('retell_call_id', call_id) \
+            .execute()
+
+        logger.info(f"✅ Queue → {db_status.upper()}: {call_id}")
+        return PlainTextResponse(f"{db_status.upper()}:{call_id}")
+
+    except Exception as e:
+        logger.error(f"❌ AMD Result error: {e}")
+        return PlainTextResponse(f"ERROR:{str(e)}", status_code=500)
+
+
 # ==========================================================
 #        VERSIÓN SÍNCRONA PARA THREADS
 # ==========================================================
 def register_call_with_retell_sync(to_number: str, from_number: str,
                                    agent_id: str, vars: dict) -> str:
-    """
-    Versión SÍNCRONA de register_call_with_retell
-    Necesaria porque los workers corren en threads normales (no async)
-    """
+    """Versión SÍNCRONA de register_call_with_retell"""
     import httpx
 
     payload = {
@@ -87,10 +166,11 @@ def register_call_with_retell_sync(to_number: str, from_number: str,
 
 
 # ==========================================================
-#        REGISTRO EN RETELL
+#        REGISTRO EN RETELL (Versión Async)
 # ==========================================================
 async def register_call_with_retell(to_number: str, from_number: str,
                                    agent_id: str, vars: dict) -> str:
+    """Versión ASYNC para uso en endpoints FastAPI"""
     payload = {
         "agent_id": agent_id,
         "from_number": from_number,
@@ -110,125 +190,55 @@ async def register_call_with_retell(to_number: str, from_number: str,
 
 
 # ==========================================================
-#               ORIGINAR EN ASTERISK
+#    🔥 SIMPLIFICADO: ORIGINATE SIN ESPERAR EVENTOS
 # ==========================================================
-def originate_in_asterisk(to_number: str, from_number: str, call_id: str):
-    import time
-    import logging
+def originate_in_asterisk(to_number: str, from_number: str, retell_call_id: str):
+    """
+    Origina llamada en Asterisk de forma simple.
+    El dialplan se encarga de AMD y notifica via HTTP.
+    """
+    import asterisk.manager
 
-    logger = logging.getLogger(__name__)
     clean_num = to_number.lstrip("+")
-    mgr = asterisk.manager.Manager()
-
-    result = {
-        "success": True,
-        "reason": "CONNECTED",
-        "detected": False,
-        "completed": False,  # ← NUEVO
-        "hangup_cause": None  # ← NUEVO
-    }
-
-    originated_channel = None  # ← NUEVO: guardar canal que originamos
-
-    # ========== EVENTO: AMD DETECTION ==========
-    def on_user_event(event, manager):
-        if event.get('UserEvent') == 'AMDDetection':
-            logger.info(f"🤖 AMD detected for {call_id}: {event.get('Result')}")
-            result['success'] = False
-            result['reason'] = 'VOICEMAIL'
-            result['cause'] = event.get('Cause', 'UNKNOWN')
-            result['detected'] = True
-
-    # ========== EVENTO: HANGUP ==========
-    def on_hangup(event, manager):
-        """Detecta cuando la llamada termina"""
-        channel = event.get('Channel', '')
-        uniqueid = event.get('Uniqueid', '')
-        cause = event.get('Cause', 'Unknown')
-        cause_text = event.get('Cause-txt', 'Unknown')
-
-        # Verificar si es el canal que originamos
-        if originated_channel and originated_channel in channel:
-            logger.info(f"📞 Hangup detected for {call_id}: {cause_text} (cause: {cause})")
-            result['completed'] = True
-            result['hangup_cause'] = cause_text
 
     try:
-        mgr.connect(AMI_HOST, AMI_PORT)
-        mgr.login(AMI_USER, AMI_PASS)
+        manager = asterisk.manager.Manager()
+        manager.connect(AMI_HOST, AMI_PORT)
+        manager.login(AMI_USER, AMI_PASS)
 
-        # Registrar listeners
-        mgr.register_event('UserEvent', on_user_event)
-        mgr.register_event('Hangup', on_hangup)  # ← NUEVO
+        logger.info(f"📡 Originating: {to_number} ({retell_call_id})")
 
-        vars = {
-            "TO_NUMBER": to_number,
-            "FROM_NUMBER": from_number,
-            "RETELL_CALL_ID": call_id
+        # Usar send_action para control total
+        response = manager.send_action({
+            'Action': 'Originate',
+            'Channel': f'Local/{clean_num}@retell-originate',
+            'Context': 'retell-bridge',
+            'Exten': 's',
+            'Priority': '1',
+            'Timeout': '45000',
+            'CallerID': f'"{from_number}" <{from_number}>',
+            'Variable': f'TO_NUMBER={to_number},FROM_NUMBER={from_number},RETELL_CALL_ID={retell_call_id}',
+            'Async': 'true'
+        })
+
+        manager.logoff()
+
+        logger.info(f"✅ Originate sent: {retell_call_id} - Response: {response}")
+
+        return {
+            'success': True,
+            'reason': 'ORIGINATED',
+            'hangup_cause': None
         }
 
-        # Originate la llamada
-        resp = mgr.originate(
-            channel=f"Local/{clean_num}@retell-originate",
-            context="retell-bridge",
-            exten="s",
-            priority=1,
-            timeout=60000,
-            caller_id=from_number,
-            variables=vars,
-        )
-
-        # Obtener el canal que se originó
-        originated_channel = f"Local/{clean_num}@retell-originate"
-        logger.info(f"📡 Originated channel: {originated_channel}")
-
-        # ========== FASE 1: ESPERAR AMD (8 segundos) ==========
-        logger.info(f"⏳ Waiting for AMD check ({call_id})...")
-        for i in range(40):  # 8 segundos
-            time.sleep(0.2)
-            if result['detected']:
-                # AMD detectó voicemail
-                logger.info(f"❌ AMD: VOICEMAIL detected ({call_id})")
-                return result
-
-        # ========== FASE 2: ESPERAR HANGUP (hasta timeout) ==========
-        if not result['detected']:
-            logger.info(f"✅ AMD passed, call is active ({call_id}). Waiting for hangup...")
-
-            # Esperar hasta 10 minutos (600 segundos) para que la llamada termine
-            max_wait = 600  # 10 minutos
-            for i in range(max_wait * 5):  # Check cada 0.2s
-                time.sleep(0.2)
-
-                if result['completed']:
-                    logger.info(f"✅ Call completed normally ({call_id})")
-                    result['reason'] = 'COMPLETED'
-                    return result
-
-                # Si AMD detectó algo tarde
-                if result['detected']:
-                    logger.info(f"❌ Late AMD detection ({call_id})")
-                    return result
-
-            # Timeout - la llamada sigue activa después de 10 minutos
-            logger.warning(f"⚠️ Call still active after {max_wait}s ({call_id})")
-            result['reason'] = 'TIMEOUT'
-            return result
-
-        return result
-
     except Exception as e:
-        logger.error(f"❌ AMI Error ({call_id}): {e}")
-        result['success'] = False
-        result['reason'] = 'ERROR'
-        result['error'] = str(e)
-        return result
+        logger.error(f"❌ AMI Error ({retell_call_id}): {e}", exc_info=True)
+        return {
+            'success': False,
+            'reason': 'ERROR',
+            'hangup_cause': str(e)
+        }
 
-    finally:
-        try:
-            mgr.logoff()
-        except:
-            pass
 
 def normalize_inbound_number(num: str, default_cc: Optional[str] = "+506") -> str:
     if not num:
@@ -250,10 +260,292 @@ def normalize_inbound_number(num: str, default_cc: Optional[str] = "+506") -> st
 #              📞 ENDPOINTS PRINCIPALES
 # ==========================================================
 
-# ============ BATCH CALL (Para tu dashboard) ============
+@router.get("/call-info/{call_id}")
+async def get_call_info(call_id: str):
+    """
+    Obtiene información de una llamada desde outbound_call_queue
+    Usado por webhook-transfer para obtener phone number
+    """
+    try:
+        result = supabase.table('outbound_call_queue') \
+            .select('*') \
+            .eq('retell_call_id', call_id) \
+            .single() \
+            .execute()
+
+        if result.data:
+            return {
+                'retell_call_id': call_id,
+                'to_number': result.data.get('phone'),
+                'from_number': result.data.get('from_number'),
+                'status': result.data.get('status'),
+                'user_name': result.data.get('user_name')
+            }
+
+        # Si no está en outbound, buscar en out_customers
+        customer = supabase.table('out_customers') \
+            .select('*') \
+            .eq('retell_call_id', call_id) \
+            .single() \
+            .execute()
+
+        if customer.data:
+            return {
+                'retell_call_id': call_id,
+                'to_number': customer.data.get('user_number'),
+                'from_number': None,
+                'status': 'active',
+                'user_name': customer.data.get('user_name')
+            }
+
+        raise HTTPException(404, f"Call {call_id} not found")
+
+    except Exception as e:
+        logger.error(f"❌ Error getting call info: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.post("/prepare-transfer")
+async def prepare_transfer(
+    transfer_id: str,
+    retell_call_id: str,
+    phone: str
+):
+    """
+    Prepara una transferencia buscando el canal de Asterisk donde está Retell.
+
+    Flujo:
+    1. Conectar a AMI
+    2. Buscar canal que tiene la variable RETELL_CALL_ID
+    3. Guardar info en memoria para execute-transfer
+    """
+    try:
+        manager = asterisk.manager.Manager()
+        manager.connect(AMI_HOST, AMI_PORT)
+        manager.login(AMI_USER, AMI_PASS)
+
+        logger.info(f"🔍 Buscando canal para Retell call: {retell_call_id}")
+
+        # Obtener todos los canales activos
+        response = manager.command('core show channels')
+        channels_output = response.data
+
+        # Buscar canal con el retell_call_id
+        retell_channel = None
+
+        # Lista de canales (parsear output de AMI)
+        # Formato típico: "PJSIP/didww_out_aux-0000009e"
+        for line in channels_output.split('\n'):
+            if 'PJSIP/' in line or 'SIP/' in line:
+                # Extraer nombre del canal
+                parts = line.strip().split()
+                if parts:
+                    channel = parts[0]
+
+                    # Verificar si este canal tiene la variable RETELL_CALL_ID
+                    try:
+                        var_response = manager.getvar(channel, 'RETELL_CALL_ID')
+                        if var_response and var_response.data == retell_call_id:
+                            retell_channel = channel
+                            logger.info(f"✅ Canal encontrado: {channel}")
+                            break
+                    except:
+                        continue
+
+        manager.logoff()
+
+        if not retell_channel:
+            logger.warning(f"⚠️ No se encontró canal para {retell_call_id}")
+            # Guardar de todos modos para intentar después
+            transfer_channels[transfer_id] = {
+                'retell_call_id': retell_call_id,
+                'retell_channel': None,
+                'phone': phone,
+                'status': 'channel_not_found'
+            }
+            return {
+                'status': 'prepared_without_channel',
+                'transfer_id': transfer_id,
+                'warning': 'Channel not found yet, will retry on execute'
+            }
+
+        # Guardar info de la transferencia
+        transfer_channels[transfer_id] = {
+            'retell_call_id': retell_call_id,
+            'retell_channel': retell_channel,
+            'phone': phone,
+            'status': 'prepared'
+        }
+
+        logger.info(f"✅ Transfer {transfer_id} prepared: {retell_channel} → Agent")
+
+        return {
+            'status': 'prepared',
+            'transfer_id': transfer_id,
+            'retell_channel': retell_channel,
+            'phone': phone
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error preparing transfer: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+
+
+@router.post("/execute-transfer")
+async def execute_transfer(
+    transfer_id: str,
+    agent_extension: str = "1002"
+):
+    """
+    Ejecuta la transferencia conectando al agente con el canal de Retell.
+
+    Flujo:
+    1. Obtener info del transfer preparado
+    2. Originate llamada al agente (PJSIP/1002)
+    3. Cuando agente contesta, bridge con canal de Retell
+    4. Hangup canal de Retell (IA se desconecta, queda solo humano)
+    """
+    if transfer_id not in transfer_channels:
+        raise HTTPException(404, f"Transfer {transfer_id} not prepared")
+
+    transfer_info = transfer_channels[transfer_id]
+    retell_channel = transfer_info.get('retell_channel')
+    retell_call_id = transfer_info.get('retell_call_id')
+    phone = transfer_info.get('phone')
+
+    try:
+        manager = asterisk.manager.Manager()
+        manager.connect(AMI_HOST, AMI_PORT)
+        manager.login(AMI_USER, AMI_PASS)
+
+        logger.info(f"📞 Ejecutando transfer: Agente {agent_extension} ← {phone}")
+
+        # Si no encontramos el canal antes, intentar de nuevo
+        if not retell_channel:
+            logger.info(f"🔍 Reintentando búsqueda de canal para {retell_call_id}")
+            response = manager.command('core show channels')
+            channels_output = response.data
+
+            for line in channels_output.split('\n'):
+                if 'PJSIP/' in line or 'SIP/' in line:
+                    parts = line.strip().split()
+                    if parts:
+                        channel = parts[0]
+                        try:
+                            var_response = manager.getvar(channel, 'RETELL_CALL_ID')
+                            if var_response and var_response.data == retell_call_id:
+                                retell_channel = channel
+                                transfer_info['retell_channel'] = channel
+                                logger.info(f"✅ Canal encontrado en retry: {channel}")
+                                break
+                        except:
+                            continue
+
+        if not retell_channel:
+            manager.logoff()
+            raise HTTPException(404, f"Retell channel not found for call {retell_call_id}")
+
+        # Originate llamada al agente con bridge automático
+        logger.info(f"📞 Calling agent {agent_extension}...")
+
+        # Usamos Originate con Bridge directo
+        response = manager.send_action({
+            'Action': 'Originate',
+            'Channel': f'PJSIP/{agent_extension}',
+            'Exten': retell_channel,  # ← Bridge directo al canal de Retell
+            'Context': 'bridge-direct',  # Contexto que hace Bridge
+            'Priority': '1',
+            'Timeout': '30000',
+            'CallerID': f'Transfer <{phone}>',
+            'Variable': f'TRANSFER_ID={transfer_id},RETELL_CALL_ID={retell_call_id},TARGET_CHANNEL={retell_channel}',
+            'Async': 'true'
+        })
+
+        logger.info(f"✅ Originate sent: {response}")
+
+        # Actualizar estado
+        transfer_info['status'] = 'bridging'
+        transfer_info['agent_extension'] = agent_extension
+
+        manager.logoff()
+
+        # Nota: El bridge se completará cuando el agente conteste
+        # El dialplan en 'bridge-direct' hará el Bridge() automático
+
+        return {
+            'status': 'bridging',
+            'transfer_id': transfer_id,
+            'agent_extension': agent_extension,
+            'retell_channel': retell_channel,
+            'phone': phone,
+            'message': 'Agent is being called, bridge will happen on answer'
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error executing transfer: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+
+
+# ==========================================================
+#     🔧 ENDPOINT AUXILIAR: COMPLETE TRANSFER
+# ==========================================================
+
+@router.post("/complete-transfer")
+async def complete_transfer(
+    transfer_id: str,
+    success: bool = True
+):
+    """
+    Marca una transferencia como completada.
+    Llamado desde el dialplan o webhook cuando el bridge termina.
+    """
+    if transfer_id in transfer_channels:
+        del transfer_channels[transfer_id]
+
+    try:
+        supabase.table('call_transfers') \
+            .update({
+                'status': 'completed' if success else 'failed',
+                'completed_at': datetime.utcnow().isoformat()
+            }) \
+            .eq('id', transfer_id) \
+            .execute()
+
+        logger.info(f"✅ Transfer {transfer_id} marked as {'completed' if success else 'failed'}")
+
+        return {'status': 'ok', 'transfer_id': transfer_id}
+    except Exception as e:
+        logger.error(f"❌ Error completing transfer: {e}")
+        return {'status': 'error', 'error': str(e)}
+
+
+# ==========================================================
+#     📊 ENDPOINT: LISTAR TRANSFERENCIAS PENDIENTES
+# ==========================================================
+
+@router.get("/pending-transfers")
+async def get_pending_transfers(token: str = Depends(verify_token)):
+    """
+    Obtiene todas las transferencias pendientes para mostrar en el dashboard
+    """
+    try:
+        result = supabase.table('call_transfers') \
+            .select('*') \
+            .eq('status', 'pending') \
+            .order('created_at', desc=True) \
+            .execute()
+
+        return {
+            'transfers': result.data or [],
+            'count': len(result.data) if result.data else 0
+        }
+    except Exception as e:
+        logger.error(f"❌ Error getting pending transfers: {e}")
+        raise HTTPException(500, str(e))
+
 @router.post("/batch-call")
 async def batch_call(calls: List[MakeCallRequest], token: str = Depends(verify_token)):
-    """Envía múltiples llamadas a la cola - USAR ESTE"""
+    """Envía múltiples llamadas a la cola"""
     if len(calls) > 100:
         raise HTTPException(400, "Max 100 calls per batch")
 
@@ -276,7 +568,6 @@ async def batch_call(calls: List[MakeCallRequest], token: str = Depends(verify_t
     }
 
 
-# ============ ESTADO DE LLAMADA ============
 @router.get("/call-status/{job_id}")
 async def get_call_status(job_id: str, token: str = Depends(verify_token)):
     """Obtiene estado de una llamada específica"""
@@ -286,7 +577,6 @@ async def get_call_status(job_id: str, token: str = Depends(verify_token)):
     return job
 
 
-# ============ ESTADO GENERAL DE LA COLA ============
 @router.get("/queue-status")
 async def get_queue_status(token: str = Depends(verify_token)):
     """Estado general de la cola"""
@@ -297,10 +587,9 @@ async def get_queue_status(token: str = Depends(verify_token)):
     }
 
 
-# ============ LLAMADA INDIVIDUAL (Opcional) ============
 @router.post("/make-call")
 async def make_call(req: MakeCallRequest, token: str = Depends(verify_token)):
-    """Llamada individual (no usar para dashboard, usar batch-call)"""
+    """Llamada individual"""
     import threading
 
     to_n = req.to_number if req.to_number.startswith("+") else f"+{req.to_number}"
@@ -315,136 +604,21 @@ async def make_call(req: MakeCallRequest, token: str = Depends(verify_token)):
         vars=vars
     )
 
-    result = {"success": None, "reason": "PENDING"}
-
+    # Originar en background
     def originate_thread():
-        try:
-            ami_result = originate_in_asterisk(to_number=to_n, from_number=from_n, call_id=call_id)
-            result.update(ami_result)
-        except Exception as e:
-            result.update({"success": False, "reason": "ERROR", "error": str(e)})
+        originate_in_asterisk(to_number=to_n, from_number=from_n, retell_call_id=call_id)
 
     thread = threading.Thread(target=originate_thread, daemon=True)
     thread.start()
-    thread.join(timeout=10)
 
-    if result['success'] is None:
-        response = {
-            "success": True,
-            "call_id": call_id,
-            "reason": "CALLING",
-            "message": "Call initiated, AMD check in progress",
-            "to_number": to_n,
-            "from_number": from_n
-        }
-    elif result['success']:
-        response = {
-            "success": True,
-            "call_id": call_id,
-            "reason": "CONNECTED",
-            "message": "Call connected successfully",
-            "to_number": to_n,
-            "from_number": from_n
-        }
-    else:
-        response = {
-            "success": False,
-            "call_id": None,
-            "reason": result['reason'],
-            "message": f"Voicemail detected: {result.get('cause', 'UNKNOWN')}",
-            "to_number": to_n,
-            "from_number": from_n
-        }
-
-    return response
-
-
-# ==========================================================
-#              🔄 TRANSFERENCIAS
-# ==========================================================
-
-@router.post("/prepare-transfer")
-async def prepare_transfer(transfer_id: str, retell_call_id: str, phone: str):
-    """Preparar transferencia - guardar info en memoria"""
-    try:
-        manager = asterisk.manager.Manager()
-        manager.connect(AMI_HOST, AMI_PORT)
-        manager.login(AMI_USER, AMI_PASS)
-
-        channels = manager.status()
-        retell_channel = None
-
-        for channel in channels:
-            try:
-                call_id_var = manager.getvar(channel.channel, 'RETELL_CALL_ID')
-                if call_id_var.data == retell_call_id:
-                    retell_channel = channel.channel
-                    break
-            except:
-                continue
-
-        manager.logoff()
-
-        if not retell_channel:
-            raise HTTPException(404, "Canal de Retell no encontrado")
-
-        pending_transfers[transfer_id] = {
-            'retell_call_id': retell_call_id,
-            'retell_channel': retell_channel,
-            'phone': phone,
-            'status': 'prepared'
-        }
-
-        return {
-            "status": "prepared",
-            "transfer_id": transfer_id,
-            "channel": retell_channel
-        }
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@router.post("/execute-transfer")
-async def execute_transfer(transfer_id: str, agent_extension: str = "1002"):
-    """Ejecutar transferencia via AMI - llamar al agente y hacer bridge"""
-
-    if transfer_id not in pending_transfers:
-        raise HTTPException(404, "Transfer no encontrado")
-
-    transfer_info = pending_transfers[transfer_id]
-    retell_channel = transfer_info['retell_channel']
-
-    try:
-        manager = asterisk.manager.Manager()
-        manager.connect(AMI_HOST, AMI_PORT)
-        manager.login(AMI_USER, AMI_PASS)
-
-        response = manager.originate(
-            channel=f'PJSIP/{agent_extension}',
-            exten='s',
-            context='bridge-transfer',
-            priority='1',
-            variables={
-                'TARGET_CHANNEL': retell_channel,
-                'TRANSFER_ID': transfer_id
-            },
-            callerid=f'Transfer <{transfer_info["phone"]}>'
-        )
-
-        manager.logoff()
-
-        transfer_info['status'] = 'bridging'
-
-        return {
-            "status": "bridging",
-            "transfer_id": transfer_id,
-            "agent": agent_extension,
-            "ami_response": str(response)
-        }
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    return {
+        "success": True,
+        "call_id": call_id,
+        "reason": "CALLING",
+        "message": "Call initiated - AMD will notify result",
+        "to_number": to_n,
+        "from_number": from_n
+    }
 
 
 # ==========================================================
@@ -486,3 +660,153 @@ async def handle_inbound_get(from_number: str, to_number: str, token: Optional[s
         call_id = r.json().get("call_id")
 
     return PlainTextResponse(call_id)
+
+
+# ==========================================================
+#     🕵️‍♂️ CLASSIFIER LOGIC
+# ==========================================================
+
+class ClassifyRequest(BaseModel):
+    phones: List[str]
+
+async def process_classification_batch(phones: List[str]):
+    """
+    Procesa el lote de clasificación en background con 'antropía' (delays aleatorios).
+    """
+    logger.info(f"🕵️‍♂️ Starting batch classification for {len(phones)} numbers (Background)")
+    
+    for i, phone in enumerate(phones):
+        p = normalize_inbound_number(phone)
+        if not p:
+            continue
+            
+        # Entropy delay (Human-like behavior)
+        if i > 0:
+            # "Coffee Break" logic: every 5-8 calls, take a longer pause
+            if i % random.randint(5, 8) == 0:
+                long_delay = random.uniform(25.0, 45.0)
+                logger.info(f"☕ Coffee Break: Pausing for {long_delay:.2f}s to mimic human fatigue")
+                await asyncio.sleep(long_delay)
+            else:
+                # Standard random sleep between 6 and 14 seconds
+                delay = random.uniform(6.0, 14.0)
+                logger.info(f"⏳ Entropy: Waiting {delay:.2f}s before classifying {p}")
+                await asyncio.sleep(delay)
+        
+        # Originate call
+        res = originate_classification_call(p)
+        if res['success']:
+            logger.info(f"🚀 Classification initiated for {p}")
+        else:
+            logger.error(f"❌ Failed to initiate classification for {p}: {res.get('reason')}")
+
+@router.post("/batch-classify")
+async def batch_classify(req: ClassifyRequest, background_tasks: BackgroundTasks, token: str = Depends(verify_token)):
+    """
+    Inicia llamadas de clasificación (Ping) para un lote de números.
+    Se ejecuta en background con intervalos aleatorios.
+    """
+    if len(req.phones) > 20:
+        raise HTTPException(400, "Max 20 phones per batch")
+
+    background_tasks.add_task(process_classification_batch, req.phones)
+        
+    return {
+        "message": "Classification started in background",
+        "count": len(req.phones),
+        "note": "Calls will be placed with random intervals (human-like behavior)"
+    }
+
+@router.get("/classifier-result")
+async def classifier_result(
+    phone: str,
+    status: str,
+    cause: str = ""
+):
+    """
+    Callback desde Asterisk para resultados de clasificación.
+    Mueve el contacto a active_contacts o inactive_contacts.
+    """
+    logger.info(f"🕵️‍♂️ Classification Result: {phone} -> {status} ({cause})")
+    
+    # 1. Buscar info del contacto original (para nombre/locale)
+    try:
+        # Intentamos obtener datos de outbound_call_contacts si existen
+        # Nota: phone viene normalizado E.164 desde Asterisk (+506...)
+        original = supabase.table('outbound_call_contacts') \
+            .select('*') \
+            .eq('phone', phone) \
+            .single() \
+            .execute()
+            
+        user_name = original.data.get('user_name') if original.data else None
+        locale = original.data.get('locale', 'es') if original.data else 'es'
+        
+        if status == 'active':
+            # Insertar en active_contacts
+            supabase.table('active_contacts').upsert({
+                'phone': phone,
+                'user_name': user_name,
+                'locale': locale,
+                'classification_details': {'cause': cause, 'status': status},
+                'last_called_at': datetime.utcnow().isoformat()
+            }, on_conflict='phone').execute()
+            
+        elif status == 'inactive':
+            # Insertar en inactive_contacts
+            supabase.table('inactive_contacts').insert({
+                'phone': phone,
+                'user_name': user_name,
+                'locale': locale,
+                'classification_cause': f"{cause}"
+            }).execute()
+
+        else:
+            # Indeterminate -> inactive_contacts with special cause label
+            # User wants to review them visually
+            cause_label = f"INDETERMINATE (Cause {cause})"
+            supabase.table('inactive_contacts').insert({
+                'phone': phone,
+                'user_name': user_name,
+                'locale': locale,
+                'classification_cause': cause_label
+            }).execute()
+            
+        return PlainTextResponse("OK")
+        
+    except Exception as e:
+        logger.error(f"❌ Error processing classifier result for {phone}: {e}")
+        return PlainTextResponse("ERROR")
+
+
+def originate_classification_call(to_number: str):
+    """
+    Origina llamada de clasificación (sin Retell)
+    """
+    import asterisk.manager
+    
+    clean_num = to_number.lstrip("+")
+    
+    try:
+        manager = asterisk.manager.Manager()
+        manager.connect(AMI_HOST, AMI_PORT)
+        manager.login(AMI_USER, AMI_PASS)
+        
+        logger.info(f"🕵️‍♂️ Classifying: {to_number}")
+        
+        response = manager.send_action({
+            'Action': 'Originate',
+            'Channel': f'Local/{clean_num}@classifier-originate',
+            'Context': 'classifier-out',  # CORRECCION: Debe coincidir o ser válido
+            'Exten': clean_num,          # CORRECCION: Pasar el numero como extensión
+            'Priority': '1',
+            'Timeout': '30000',
+            'Async': 'true'
+        })
+        
+        manager.logoff()
+        return {'success': True}
+        
+    except Exception as e:
+        logger.error(f"❌ Classifier AMI Error: {e}")
+        return {'success': False, 'reason': str(e)}

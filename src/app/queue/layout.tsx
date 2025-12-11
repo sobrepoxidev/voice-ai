@@ -53,11 +53,11 @@ export default async function QueueLayout({
   const nombre = user.user_metadata?.nombre ?? "Usuario";
 
   return (
-    <div className="flex h-screen flex-col md:flex-row bg-gray-50">
+    <div className="flex h-screen bg-gray-50">
       <DashboardNav userName={nombre} />
       <div className="flex-1 flex flex-col overflow-hidden">
         <AgentStatus userName={nombre} userId={user.id} />
-        <main className="flex-1 overflow-auto p-2 sm:p-6">{children}</main>
+        <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>
     </div>
   );

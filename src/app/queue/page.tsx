@@ -162,11 +162,11 @@ export default function QueuePage() {
 
   return (
     <div className="space-y-6 ">
-      <h1 className="text-2xl md:text-3xl font-bold text-gray-900">Cola de Llamadas</h1>
+      <h1 className="text-3xl font-bold text-gray-900">Cola de Llamadas</h1>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="bg-white rounded-lg shadow p-4 md:p-6 col-span-1 lg:col-span-2">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-4 gap-2 sm:gap-0">
+        <div className="bg-white rounded-lg shadow p-6 col-span-1 lg:col-span-2">
+          <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-bold text-gray-900">Llamadas Activas</h2>
             <div className="flex items-center gap-2">
               <span className="text-sm text-gray-500">Auto-actualización</span>
@@ -198,20 +198,18 @@ export default function QueuePage() {
                   <button
                     key={`${call.phone}-${call.updated_at}`}
                     onClick={() => openCard(call)}
-                    className="w-full text-left flex flex-col sm:flex-row items-start sm:items-center gap-3 p-3 bg-white border rounded-lg hover:shadow-sm transition-shadow"
+                    className="w-full text-left flex items-center gap-3 p-3 bg-white border rounded-lg hover:shadow-sm transition-shadow"
                   >
-                    <div className="flex items-center gap-3 w-full sm:w-auto flex-1 min-w-0">
-                      <div className={`shrink-0 ${cfg.text}`}>{cfg.icon}</div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className="font-medium text-gray-900 truncate">{call.user_name || 'Sin nombre'}</p>
-                          <span className={`text-xs px-2 py-1 rounded ${cfg.bg} ${cfg.text} whitespace-nowrap`}>{cfg.label}</span>
-                        </div>
-                        <p className="text-sm text-gray-500">{call.phone}</p>
+                    <div className={`shrink-0 ${cfg.text}`}>{cfg.icon}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p className="font-medium text-gray-900 truncate">{call.user_name || 'Sin nombre'}</p>
+                        <span className={`text-xs px-2 py-1 rounded ${cfg.bg} ${cfg.text}`}>{cfg.label}</span>
                       </div>
+                      <p className="text-sm text-gray-500">{call.phone}</p>
                     </div>
                     {call.call_duration_seconds && call.call_duration_seconds > 0 && (
-                      <div className="text-left sm:text-right w-full sm:w-auto pl-7 sm:pl-0">
+                      <div className="text-right">
                         <p className="text-sm font-medium text-gray-900">{formatDuration(call.call_duration_seconds)}</p>
                         <p className="text-xs text-gray-500">Duración</p>
                       </div>
@@ -223,9 +221,9 @@ export default function QueuePage() {
           </div>
         </div>
 
-        <div className="bg-white rounded-lg shadow p-4 md:p-6">
+        <div className="bg-white rounded-lg shadow p-6">
           <h2 className="text-xl font-bold text-gray-900 mb-4">Métricas</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <div className="bg-green-50 rounded-lg p-3 border border-green-200">
               <div className="text-2xl font-bold text-green-700">{queue.active_calls}</div>
               <div className="text-xs text-green-600">Activas</div>
@@ -246,21 +244,19 @@ export default function QueuePage() {
               <div className="text-gray-500">Sin historial</div>
             ) : (
               historial.map((h, idx) => (
-                <div key={`${h.phone}-${h.updated_at}-${idx}`} className="flex flex-col sm:flex-row items-start sm:items-center gap-3 p-3 bg-white border rounded-lg">
-                  <div className="flex items-center gap-3 w-full sm:w-auto flex-1 min-w-0">
-                    <div className="shrink-0 text-gray-400">
-                      <Clock size={16} />
+                <div key={`${h.phone}-${h.updated_at}-${idx}`} className="flex items-center gap-3 p-3 bg-white border rounded-lg">
+                  <div className="shrink-0 text-gray-400">
+                    <Clock size={16} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="font-medium text-gray-900 truncate">{h.user_name || 'Sin nombre'}</p>
+                      <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-600 rounded">{h.status}</span>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <p className="font-medium text-gray-900 truncate">{h.user_name || 'Sin nombre'}</p>
-                        <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-600 rounded whitespace-nowrap">{h.status}</span>
-                      </div>
-                      <p className="text-sm text-gray-500">{h.phone}</p>
-                    </div>
+                    <p className="text-sm text-gray-500">{h.phone}</p>
                   </div>
                   {h.call_duration_seconds && (
-                    <div className="text-left sm:text-right w-full sm:w-auto pl-7 sm:pl-0">
+                    <div className="text-right">
                       <p className="text-sm font-medium text-gray-900">{formatDuration(h.call_duration_seconds)}</p>
                       <p className="text-xs text-gray-500">Duración</p>
                     </div>

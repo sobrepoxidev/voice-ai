@@ -63,10 +63,10 @@ export default async function ClientsPage() {
   const localeEs = customers.filter((c) => (c.locale ?? 'es') === 'es').length;
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl md:text-3xl font-bold text-gray-900">Clientes</h1>
+    <div className="space-y-6 ">
+      <h1 className="text-3xl font-bold text-gray-900">Clientes</h1>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-white rounded-lg shadow p-4 border">
           <div className="text-2xl font-bold text-gray-900">{total}</div>
           <div className="text-xs text-gray-600">Total</div>

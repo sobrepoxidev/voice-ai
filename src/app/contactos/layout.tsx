@@ -38,7 +38,7 @@ export default async function ContactosLayout({
   const nombre = user.user_metadata?.nombre ?? 'Usuario';
 
   return (
-    <div className="flex h-screen flex-col md:flex-row bg-gray-50">
+    <div className="flex h-screen bg-gray-50">
       {/* Navegación Lateral */}
       <DashboardNav userName={nombre} />
 
@@ -48,7 +48,7 @@ export default async function ContactosLayout({
         <AgentStatus userName={nombre} userId={user.id} />
 
         {/* Área de contenido */}
-        <main className="flex-1 overflow-auto p-2 sm:p-6">{children}</main>
+        <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>
     </div>
   );

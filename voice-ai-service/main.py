@@ -14,6 +14,12 @@ from whatsapp import WhatsAppService
 
 load_dotenv()
 
+import logging
+logger = logging.getLogger(__name__)
+
+# Constantes
+SHORT_CALL_THRESHOLD_SECONDS = 15  # Llamadas menores a esto = short_call
+
 # ====== CONFIG ======
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -256,24 +262,37 @@ def _update_customer_out(user_number: str, name: Optional[str] = None,
 #=======  NUEVO WEBHOOK DE RESPALDO ======
 @app.post("/api/retell/webhook-out")
 async def retell_webhook_out(request: Request):
-    """Maneja eventos de Retell (sin lógica de cola/concurrencia por ahora)."""
+    """Maneja eventos de Retell con detección de estados avanzados."""
     try:
         payload = await request.json()
     except Exception:
         payload = {}
 
-    print("📞 Webhook recibido")
     event = payload.get("event") or payload.get("type")
+    logger.info(f"📞 Webhook: {event}")
 
     # ========== CALL STARTED ==========
     if event == "call_started":
         call = payload.get("call") or {}
-        user_number = norm_phone(call.get("to_number") or "+50662633553")
-        call_id = call.get("call_id") or "testid"
+        call_id = call.get("call_id")
+        to_number = call.get("to_number")
 
+        if call_id:
+            try:
+                supabase.table('outbound_call_queue') \
+                    .update({
+                        'status': 'active',
+                        'updated_at': datetime.utcnow().isoformat()
+                    }) \
+                    .eq('retell_call_id', call_id) \
+                    .execute()
+                logger.info(f"✅ Queue → ACTIVE: {call_id}")
+            except Exception as e:
+                logger.error(f"❌ Error updating to active: {e}")
+
+        # Actualizar CRM
+        user_number = norm_phone(to_number)
         if user_number:
-            print(f"✅ call_started - User Number: {user_number}, Call ID: {call_id}")
-            # Marca en tu CRM (out_customers)
             _update_customer_out(
                 user_number=user_number,
                 call_id=call_id,
@@ -287,44 +306,55 @@ async def retell_webhook_out(request: Request):
     # ========== CALL ENDED ==========
     if event == "call_ended":
         call = payload.get("call") or {}
+        call_id = call.get("call_id")
         to_number = call.get("to_number")
-        user_number = norm_phone(to_number) if to_number else None
-        call_id = call.get("call_id") or "testid"
 
-        print(
-            f"📞 call_ended - to_number raw: '{to_number}', "
-            f"normalizado: '{user_number}', Call ID: {call_id}",
-            flush=True,
-        )
+        # Calcular duración
+        start_ts = call.get("start_timestamp")
+        end_ts = call.get("end_timestamp")
+        duration_seconds = 0
 
-        if not user_number:
-            dynamic_variables = call.get("retell_llm_dynamic_variables") or {}
-            dyn_number = dynamic_variables.get("user_number")
-            user_number = norm_phone(dyn_number) if dyn_number else None
-            print(
-                f"📞 Intentando obtener de dynamic_variables: '{dyn_number}' -> '{user_number}'",
-                flush=True,
-            )
+        if start_ts and end_ts:
+            try:
+                duration_seconds = (end_ts - start_ts) // 1000  # ms → s
+            except:
+                duration_seconds = 0
 
-        user_name = (
-            (call.get("retell_llm_dynamic_variables") or {}).get("user_name")
-            or "Cliente"
-        )
-        print(f"👤 Usuario: {user_name}", flush=True)
+        # Determinar estado basado en duración
+        # Si es muy corta, probablemente colgó sin hablar
+        if duration_seconds < SHORT_CALL_THRESHOLD_SECONDS:
+            final_status = 'short_call'
+            end_reason = f"DURATION_{duration_seconds}s"
+        else:
+            # Por defecto finished, call_analyzed puede cambiar a callback
+            final_status = 'finished'
+            end_reason = 'COMPLETED'
 
+        if call_id:
+            try:
+                supabase.table('outbound_call_queue') \
+                    .update({
+                        'status': final_status,
+                        'active': False,
+                        'call_duration_seconds': duration_seconds,
+                        'end_reason': end_reason,
+                        'updated_at': datetime.utcnow().isoformat()
+                    }) \
+                    .eq('retell_call_id', call_id) \
+                    .execute()
+                logger.info(f"✅ Queue → {final_status.upper()} ({duration_seconds}s): {call_id}")
+            except Exception as e:
+                logger.error(f"❌ Error updating to {final_status}: {e}")
+
+        # Actualizar CRM
+        user_number = norm_phone(to_number)
         if user_number:
-            print(f"✅ Guardando call_ended para {user_number}", flush=True)
             _update_customer_out(
                 user_number=user_number,
                 call_id=call_id,
                 event="call_ended",
-                summary="Llamada finalizada",
+                summary=f"Llamada finalizada ({duration_seconds}s)",
                 sentiment="Neutral",
-            )
-        else:
-            print(
-                f"⚠️ call_ended SIN número válido - NO se guarda en DB. Call ID: {call_id}",
-                flush=True,
             )
 
         return PlainTextResponse("", status_code=204)
@@ -332,30 +362,59 @@ async def retell_webhook_out(request: Request):
     # ========== CALL ANALYZED ==========
     if event == "call_analyzed":
         call = payload.get("call") or {}
+        call_id = call.get("call_id")
         to_number = call.get("to_number")
-        user_number = norm_phone(to_number) if to_number else None
-        call_id = call.get("call_id") or "testid"
-
-        print(
-            f"📊 call_analyzed - to_number: '{to_number}' -> '{user_number}', "
-            f"Call ID: {call_id}",
-            flush=True,
-        )
 
         call_analysis = call.get("call_analysis") or {}
         summary = call_analysis.get("call_summary") or "Sin análisis"
         sentiment = call_analysis.get("user_sentiment") or "Neutral"
 
+        # Buscar si el usuario pidió callback en el análisis
         custom_data = call_analysis.get("custom_analysis_data") or {}
-        usernamed = custom_data.get("usernamed")
+
+        # Retell puede devolver campos personalizados como:
+        # - "callback_requested": true/false
+        # - "call_outcome": "callback" | "completed" | "not_interested"
+        callback_requested = custom_data.get("callback_requested", False)
+        call_outcome = custom_data.get("call_outcome", "").lower()
+
+        # También buscar en el summary palabras clave
+        summary_lower = summary.lower()
+        callback_keywords = [
+            "llamar después", "call back", "callback",
+            "volver a llamar", "no puede hablar",
+            "ocupado", "busy", "later", "otro momento",
+            "reprogramar", "reschedule"
+        ]
+
+        has_callback_keyword = any(kw in summary_lower for kw in callback_keywords)
+
+        # Determinar si es callback
+        is_callback = callback_requested or call_outcome == "callback" or has_callback_keyword
+
+        if is_callback and call_id:
+            try:
+                supabase.table('outbound_call_queue') \
+                    .update({
+                        'status': 'callback',
+                        'end_reason': 'CALLBACK_REQUESTED',
+                        'updated_at': datetime.utcnow().isoformat()
+                    }) \
+                    .eq('retell_call_id', call_id) \
+                    .execute()
+                logger.info(f"✅ Queue → CALLBACK: {call_id}")
+            except Exception as e:
+                logger.error(f"❌ Error updating to callback: {e}")
+
+        # Extraer nombre si está disponible
+        usernamed = custom_data.get("user_name") or custom_data.get("usernamed")
         if not usernamed:
             dv = call.get("retell_llm_dynamic_variables") or {}
-            usernamed = dv.get("customer_name")
+            usernamed = dv.get("customer_name") or dv.get("user_name")
 
-        print(f"👤 Nombre detectado: {usernamed}", flush=True)
-
+        # Actualizar CRM
+        user_number = norm_phone(to_number)
         if user_number:
-            print(f"✅ Guardando análisis para {user_number}", flush=True)
             _update_customer_out(
                 user_number=user_number,
                 name=usernamed,
@@ -364,15 +423,9 @@ async def retell_webhook_out(request: Request):
                 summary=summary,
                 sentiment=sentiment,
             )
-        else:
-            print(
-                f"⚠️ call_analyzed SIN número válido - NO se guarda. Call ID: {call_id}",
-                flush=True,
-            )
 
         return PlainTextResponse("", status_code=204)
 
-    # Otros eventos se ignoran de forma silenciosa
     return PlainTextResponse("", status_code=204)
 
 
